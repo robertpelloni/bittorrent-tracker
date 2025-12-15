@@ -15,6 +15,7 @@ import parseHttpRequest from './lib/server/parse-http.js'
 import parseUdpRequest from './lib/server/parse-udp.js'
 import parseWebSocketRequest from './lib/server/parse-websocket.js'
 import { validateManifest } from './lib/manifest.js'
+import { LRUCache } from 'lru-cache'
 
 const debug = Debug('bittorrent-tracker:server')
 const hasOwnProperty = Object.prototype.hasOwnProperty
@@ -54,7 +55,10 @@ class Server extends EventEmitter {
     this.listening = false
     this.destroyed = false
     this.torrents = {}
-    this.manifests = {} // PublicKey -> Manifest
+
+    // LRU Cache for Manifests (max 1000 items)
+    this.manifests = new LRUCache({ max: 1000 })
+
     this.subscriptions = {} // PublicKey -> Set<Socket>
 
     this.http = null
@@ -649,28 +653,32 @@ class Server extends EventEmitter {
         return cb(new Error('Invalid signature'))
       }
     } catch (e) {
-      return cb(e)
+      return cb(new Error('Manifest validation failed: ' + e.message))
     }
 
     const key = params.manifest.publicKey
-    const current = this.manifests[key]
+    const current = this.manifests.get(key)
 
     if (current && params.manifest.sequence <= current.sequence) {
       return cb(new Error('Sequence too low'))
     }
 
     // Store manifest
-    this.manifests[key] = params.manifest
+    this.manifests.set(key, params.manifest)
     debug('Manifest updated for %s seq=%d', key, params.manifest.sequence)
 
     // Broadcast to subscribers
     if (this.subscriptions[key]) {
       this.subscriptions[key].forEach(socket => {
         if (socket.readyState === 1) { // OPEN
-          socket.send(JSON.stringify({
-            action: 'publish',
-            manifest: params.manifest
-          }))
+          try {
+            socket.send(JSON.stringify({
+              action: 'publish',
+              manifest: params.manifest
+            }))
+          } catch (err) {
+            debug('Broadcast failed for peer %s: %s', socket.peerId, err.message)
+          }
         }
       })
     }
@@ -687,22 +695,36 @@ class Server extends EventEmitter {
     }
     this.subscriptions[key].add(socket)
 
+    // Track subscriptions on the socket for efficient cleanup
+    if (!socket.subscribedKeys) {
+      socket.subscribedKeys = new Set()
+    }
+    socket.subscribedKeys.add(key)
+
     // Send latest if available
-    if (this.manifests[key]) {
-      socket.send(JSON.stringify({
-        action: 'publish',
-        manifest: this.manifests[key]
-      }))
+    const cached = this.manifests.get(key)
+    if (cached) {
+      try {
+        socket.send(JSON.stringify({
+          action: 'publish',
+          manifest: cached
+        }))
+      } catch (err) {
+        debug('Initial send failed for peer %s: %s', socket.peerId, err.message)
+      }
     }
 
     // Cleanup on close
     if (!socket._cleanupSetup) {
       socket.on('close', () => {
-        // We have to iterate since we don't store reverse mapping efficiently here
-        // (Optimally we should store subscribed keys on socket)
-        for (const k in this.subscriptions) {
-          this.subscriptions[k].delete(socket)
-          if (this.subscriptions[k].size === 0) delete this.subscriptions[k]
+        if (socket.subscribedKeys) {
+          for (const k of socket.subscribedKeys) {
+            if (this.subscriptions[k]) {
+              this.subscriptions[k].delete(socket)
+              if (this.subscriptions[k].size === 0) delete this.subscriptions[k]
+            }
+          }
+          socket.subscribedKeys.clear()
         }
       })
       socket._cleanupSetup = true
