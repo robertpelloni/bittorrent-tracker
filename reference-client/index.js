@@ -6,17 +6,20 @@ import minimist from 'minimist'
 import Client from 'bittorrent-tracker'
 import { generateKeypair } from './lib/crypto.js'
 import { createManifest, validateManifest } from './lib/manifest.js'
+import { ingest, reassemble } from './lib/storage.js'
 
 const argv = minimist(process.argv.slice(2), {
   alias: {
     k: 'keyfile',
     t: 'tracker',
     i: 'input',
-    o: 'output'
+    o: 'output',
+    d: 'dir'
   },
   default: {
     keyfile: './identity.json',
-    tracker: 'ws://localhost:8000' // Default to local WS tracker
+    tracker: 'ws://localhost:8000', // Default to local WS tracker
+    dir: './storage'
   }
 })
 
@@ -25,10 +28,16 @@ const command = argv._[0]
 if (!command) {
   console.error(`Usage:
   gen-key [-k identity.json]
-  publish [-k identity.json] [-t ws://tracker] -i magnet_list.txt
-  subscribe [-t ws://tracker] <public_key_hex>
+  ingest -i <file> [-d ./storage] -> Returns FileEntry JSON
+  publish [-k identity.json] [-t ws://tracker] -i <file_entry.json>
+  subscribe [-t ws://tracker] <public_key_hex> [-d ./storage]
   `)
   process.exit(1)
+}
+
+// Ensure storage dir exists
+if (!fs.existsSync(argv.dir)) {
+  fs.mkdirSync(argv.dir, { recursive: true })
 }
 
 // 1. Generate Key
@@ -44,7 +53,27 @@ if (command === 'gen-key') {
   process.exit(0)
 }
 
-// 2. Publish
+// 2. Ingest
+if (command === 'ingest') {
+  if (!argv.input) {
+    console.error('Please specify input file with -i')
+    process.exit(1)
+  }
+  const fileBuf = fs.readFileSync(argv.input)
+  const result = ingest(fileBuf, path.basename(argv.input))
+
+  // Save Blobs
+  result.blobs.forEach(blob => {
+    fs.writeFileSync(path.join(argv.dir, blob.id), blob.buffer)
+  })
+
+  console.log(`Ingested ${result.blobs.length} blobs to ${argv.dir}`)
+  console.log('FileEntry JSON (save this to a file to publish it):')
+  console.log(JSON.stringify(result.fileEntry, null, 2))
+  process.exit(0)
+}
+
+// 3. Publish
 if (command === 'publish') {
   if (!fs.existsSync(argv.keyfile)) {
     console.error('Keyfile not found. Run gen-key first.')
@@ -56,23 +85,32 @@ if (command === 'publish') {
     secretKey: Buffer.from(keyData.secretKey, 'hex')
   }
 
-  // Read magnet links
+  // Read Input
   if (!argv.input) {
-    console.error('Please specify input file with -i (list of magnet links)')
+    console.error('Please specify input file with -i (json file entry or text list)')
     process.exit(1)
   }
-  const content = fs.readFileSync(argv.input, 'utf-8')
-  const lines = content.split('\n').map(l => l.trim()).filter(l => l.length > 0)
 
-  // Create Collections structure (flat for now)
+  const content = fs.readFileSync(argv.input, 'utf-8')
+  let items
+  try {
+    // Try parsing as JSON (FileEntry)
+    const json = JSON.parse(content)
+    // Wrap in our "Items" list.
+    // In the future, "Items" can be Magnet Links OR FileEntries.
+    items = [json]
+  } catch (e) {
+    // Fallback: Line-separated magnet links
+    items = content.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+  }
+
+  // Create Collections structure
   const collections = [{
     title: 'Default Collection',
-    items: lines
+    items
   }]
 
   // Create Manifest
-  // TODO: Retrieve last sequence from somewhere or store it?
-  // For now, we use timestamp as sequence to be simple and monotonic
   const sequence = Date.now()
   const manifest = createManifest(keypair, sequence, collections)
 
@@ -123,7 +161,7 @@ if (command === 'publish') {
   }, 1000)
 }
 
-// 3. Subscribe
+// 4. Subscribe
 if (command === 'subscribe') {
   const pubKeyHex = argv._[1]
   if (!pubKeyHex) {
@@ -166,7 +204,37 @@ if (command === 'subscribe') {
             if (valid && data.manifest.publicKey === pubKeyHex) {
               console.log('VERIFIED UPDATE from ' + pubKeyHex)
               console.log('Sequence:', data.manifest.sequence)
-              console.log('Items:', data.manifest.collections[0].items)
+
+              const items = data.manifest.collections[0].items
+              console.log(`Received ${items.length} items.`)
+
+              // Auto-Download Logic (Prototype)
+              items.forEach(async (item, idx) => {
+                if (typeof item === 'object' && item.chunks) {
+                  console.log(`Item ${idx}: Detected Megatorrent FileEntry: ${item.name}`)
+                  try {
+                    const fileBuf = await reassemble(item, async (blobId) => {
+                      const p = path.join(argv.dir, blobId)
+                      if (fs.existsSync(p)) {
+                        return fs.readFileSync(p)
+                      }
+                      // TODO: Network fetch
+                      console.log(`Blob ${blobId} not found locally.`)
+                      return null
+                    })
+
+                    if (fileBuf) {
+                      const outPath = path.join(argv.dir, 'downloaded_' + item.name)
+                      fs.writeFileSync(outPath, fileBuf)
+                      console.log(`SUCCESS: Reassembled to ${outPath}`)
+                    }
+                  } catch (err) {
+                    console.error('Failed to reassemble:', err.message)
+                  }
+                } else {
+                  console.log(`Item ${idx}: Standard Magnet/Text: ${item}`)
+                }
+              })
             } else {
               console.error('Invalid signature or wrong key!')
             }
