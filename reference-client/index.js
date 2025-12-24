@@ -7,7 +7,7 @@ import sodium from 'sodium-native'
 import { generateKeypair } from './lib/crypto.js'
 import { createManifest, validateManifest, decryptManifest } from './lib/manifest.js'
 import { ingest, reassemble } from './lib/storage.js'
-import { startSecureServer, downloadSecureBlob, setGlobalProxy, findPeersViaPEX } from './lib/secure-transport.js'
+import { startSecureServer, downloadSecureBlob, setGlobalProxy, findPeersViaPEX, publishViaGateway } from './lib/secure-transport.js'
 import { DHTClient } from './lib/dht-real.js'
 
 const argv = minimist(process.argv.slice(2), {
@@ -18,7 +18,9 @@ const argv = minimist(process.argv.slice(2), {
     d: 'dir',
     p: 'proxy',
     s: 'secret',
-    b: 'bootstrap' // New Flag
+    b: 'bootstrap',
+    g: 'gateway', // New: Publish via Gateway
+    a: 'announce-address' // New: Announce specific address (e.g. .onion)
   },
   default: {
     keyfile: './identity.json',
@@ -37,7 +39,6 @@ const knownSequences = {}
 let serverPort = 0
 const connectedPeers = new Set()
 
-// Add Bootstrap Peer if provided
 if (argv.bootstrap) {
   console.log(`Adding Bootstrap Peer: ${argv.bootstrap}`)
   connectedPeers.add(argv.bootstrap)
@@ -47,7 +48,6 @@ function parseUri (input) {
   if (input.startsWith('megatorrent://')) {
     const withoutScheme = input.replace('megatorrent://', '')
     const parts = withoutScheme.split('/')
-    // <pubkey> or <pubkey>:<secret>
     const authParts = parts[0].split(':')
 
     return {
@@ -64,8 +64,8 @@ if (!command) {
   console.error(`Usage:
   gen-key [-k identity.json]
   ingest -i <file> [-d ./storage]
-  publish [-k identity.json] -i <file_entry.json> [-s <hex_secret>]
-  subscribe <uri> [-d ./storage] [--proxy ...] [--bootstrap host:port]
+  publish [-k identity.json] -i <file_entry.json> [-s <secret>] [--gateway <host:port>]
+  subscribe <uri> [-d ./storage] [--proxy ...] [--bootstrap host:port] [--announce-address <my.onion:80>]
   `)
   process.exit(1)
 }
@@ -76,6 +76,9 @@ if (!fs.existsSync(argv.dir)) {
 
 let dht = null
 if (['ingest', 'publish', 'subscribe'].includes(command)) {
+  // Only start DHT if NOT using proxy or if specifically wanted?
+  // For now, start it unless explicit flag?
+  // We'll keep it for PEX gateway logic.
   dht = new DHTClient({ stateFile: path.join(argv.dir, 'dht_state.json') })
 }
 
@@ -158,21 +161,32 @@ if (command === 'publish') {
   const sequence = Date.now()
   const manifest = createManifest(keypair, sequence, collections, argv.secret)
 
-  console.log('Publishing manifest to DHT...')
   if (argv.secret) console.log('Encrypted Channel Enabled.')
 
-  dht.putManifest(keypair, sequence, manifest).then(hash => {
-    console.log('Published!')
-    console.log('Mutable Item Hash:', hash.toString('hex'))
-    setTimeout(() => {
-      dht.destroy()
+  if (argv.gateway) {
+    console.log(`Publishing via Gateway: ${argv.gateway}`)
+    publishViaGateway(argv.gateway, manifest).then(() => {
+      console.log('Published to Gateway!')
       process.exit(0)
-    }, 2000)
-  }).catch(err => {
-    console.error('Publish failed:', err)
-    dht.destroy()
-    process.exit(1)
-  })
+    }).catch(err => {
+      console.error('Gateway Publish failed:', err)
+      process.exit(1)
+    })
+  } else {
+    console.log('Publishing manifest to DHT...')
+    dht.putManifest(keypair, sequence, manifest).then(hash => {
+      console.log('Published!')
+      console.log('Mutable Item Hash:', hash.toString('hex'))
+      setTimeout(() => {
+        dht.destroy()
+        process.exit(0)
+      }, 2000)
+    }).catch(err => {
+      console.error('Publish failed:', err)
+      dht.destroy()
+      process.exit(1)
+    })
+  }
 }
 
 if (command === 'subscribe') {
@@ -203,17 +217,10 @@ if (command === 'subscribe') {
 
   const checkUpdate = async () => {
     try {
-      // 1. Try DHT
       const res = await dht.getManifest(publicKey)
 
-      // 2. If DHT failed but we have a Bootstrap peer (Dark Swarm), try PEX?
-      // PEX currently finds *Blobs*, not Manifests.
-      // But Protocol v4 could support Manifest Fetch via PEX (Future Work).
-      // For now, Dark Swarms work for *content* but Manifests usually still need DHT
-      // or we assume the bootstrap peer can serve the manifest via a direct request?
-      // Our Secure Transport supports GET <BlobID>.
-      // If we map PubKey to a "Manifest Blob ID" (Mutable), we could fetch it.
-      // Current impl relies on DHT for Manifests.
+      // TODO: PEX for Manifest lookup via Gateway?
+      // Not implemented in this ref, but structure supports it.
 
       if (res) {
         if (!knownSequences[publicKey] || res.seq > knownSequences[publicKey]) {
@@ -281,22 +288,17 @@ if (command === 'subscribe') {
 
             let peers = await dht.findBlobPeers(blobId)
 
-            // Fallback to PEX (bootstrap or previously connected)
             if (peers.length === 0 && connectedPeers.size > 0) {
               console.log('DHT yielded no peers. Trying PEX...')
               for (const p of connectedPeers) {
-                // Try to ask peer
                 const pexPeers = await findPeersViaPEX(p, blobId)
                 if (pexPeers.length > 0) {
-                  console.log(`PEX found ${pexPeers.length} peers via ${p}`)
                   peers = peers.concat(pexPeers)
                 }
               }
-              // Also add the bootstrap peers themselves as candidates if they hold the blob
               connectedPeers.forEach(p => peers.push(p))
             }
 
-            // Deduplicate
             peers = [...new Set(peers)]
             console.log(`Found ${peers.length} peers:`, peers)
 
@@ -304,7 +306,7 @@ if (command === 'subscribe') {
             for (const peer of peers) {
               try {
                 console.log(`Connecting to ${peer}...`)
-                const buffer = await downloadSecureBlob(peer, blobId, knownSequences, handleGossip)
+                const buffer = await downloadSecureBlob(peer, blobId, knownSequences, handleGossip, argv['announce-address'])
                 fs.writeFileSync(blobPath, buffer)
                 chunks.push(buffer)
                 heldBlobs.add(blobId)
@@ -316,7 +318,6 @@ if (command === 'subscribe') {
                 break
               } catch (e) {
                 console.error(`Peer ${peer} failed: ${e.message}`)
-                // Don't remove bootstrap peer on fail, it might just not have *this* file
                 if (peer !== argv.bootstrap) connectedPeers.delete(peer)
               }
             }

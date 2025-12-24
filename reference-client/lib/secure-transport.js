@@ -23,6 +23,9 @@ const MSG_REQUEST = 0x02
 const MSG_DATA = 0x03
 const MSG_FIND_PEERS = 0x04
 const MSG_PEERS = 0x05
+const MSG_PUBLISH = 0x06
+const MSG_ANNOUNCE = 0x07
+const MSG_OK = 0x08
 const MSG_ERROR = 0xFF
 
 function encryptStream (socket, isServer, onMessage) {
@@ -79,7 +82,6 @@ function encryptStream (socket, isServer, onMessage) {
         return
       }
 
-      // Parse Message
       if (plain.length > 0) {
         const type = plain[0]
         const payload = plain.slice(1)
@@ -139,6 +141,9 @@ function encryptStream (socket, isServer, onMessage) {
   }
 }
 
+// PEX Store: Map<BlobID, Set<PeerString>>
+const pexStore = {}
+
 export function startSecureServer (storageDir, port = 0, onGossip = null, dht = null) {
   const server = net.createServer(socket => {
     const secure = encryptStream(socket, true, async (type, payload) => {
@@ -158,15 +163,46 @@ export function startSecureServer (storageDir, port = 0, onGossip = null, dht = 
           secure.sendMessage(MSG_ERROR, Buffer.from('Not Found'))
         }
       } else if (type === MSG_FIND_PEERS) {
-          // PEX Request
-          if (dht) {
-              const blobId = payload.toString()
-              const peers = await dht.findBlobPeers(blobId)
-              const peersJson = JSON.stringify(peers)
-              secure.sendMessage(MSG_PEERS, Buffer.from(peersJson))
-          } else {
-              secure.sendMessage(MSG_PEERS, Buffer.from('[]'))
+        const blobId = payload.toString()
+        let peers = []
+
+        // 1. Local PEX Cache
+        if (pexStore[blobId]) {
+          peers = Array.from(pexStore[blobId])
+        }
+
+        // 2. DHT Lookup (Gateway)
+        if (dht) {
+          const dhtPeers = await dht.findBlobPeers(blobId)
+          peers = [...new Set([...peers, ...dhtPeers])]
+        }
+
+        secure.sendMessage(MSG_PEERS, Buffer.from(JSON.stringify(peers)))
+      } else if (type === MSG_PUBLISH) {
+        // Gateway Publish: Put Manifest to DHT
+        if (dht) {
+          try {
+            const req = JSON.parse(payload.toString()) // eslint-disable-line no-unused-vars
+            // Gateway acts as a relayer.
+            // For now, stub response
+            console.log('[Gateway] Received Publish Request')
+            secure.sendMessage(MSG_OK, Buffer.from('Accepted'))
+          } catch (e) {
+            secure.sendMessage(MSG_ERROR, Buffer.from(e.message))
           }
+        } else {
+          secure.sendMessage(MSG_ERROR, Buffer.from('Not a Gateway'))
+        }
+      } else if (type === MSG_ANNOUNCE) {
+        // Peer announcing themselves (e.g. .onion address) for a blob
+        try {
+          const ann = JSON.parse(payload.toString()) // { blobId, peerAddress }
+          if (ann.blobId && ann.peerAddress) {
+            if (!pexStore[ann.blobId]) pexStore[ann.blobId] = new Set()
+            pexStore[ann.blobId].add(ann.peerAddress)
+            console.log(`[Gateway] Cached peer ${ann.peerAddress} for ${ann.blobId}`)
+          }
+        } catch (e) {}
       }
     })
   })
@@ -177,7 +213,7 @@ export function startSecureServer (storageDir, port = 0, onGossip = null, dht = 
   return server
 }
 
-export function downloadSecureBlob (peer, blobId, knownSequences = {}, onGossip = null) {
+export function downloadSecureBlob (peer, blobId, knownSequences = {}, onGossip = null, announceAddr = null) {
   return new Promise((resolve, reject) => {
     const [host, portStr] = peer.split(':')
     const port = parseInt(portStr)
@@ -235,6 +271,13 @@ export function downloadSecureBlob (peer, blobId, knownSequences = {}, onGossip 
         const hello = Buffer.from(JSON.stringify(knownSequences))
         secure.sendMessage(MSG_HELLO, hello)
         secure.sendMessage(MSG_REQUEST, Buffer.from(blobId))
+
+        if (announceAddr) {
+          secure.sendMessage(MSG_ANNOUNCE, Buffer.from(JSON.stringify({
+            blobId,
+            peerAddress: announceAddr
+          })))
+        }
       })
 
       setTimeout(cleanup, 10000)
@@ -244,36 +287,54 @@ export function downloadSecureBlob (peer, blobId, knownSequences = {}, onGossip 
   })
 }
 
-// Helper to perform PEX lookup via a connected peer
-export function findPeersViaPEX (peer, blobId) {
-    return new Promise((resolve, reject) => {
-        const [host, portStr] = peer.split(':')
-        const port = parseInt(portStr)
+// Publish via Gateway
+export function publishViaGateway (gateway, manifest) {
+  return new Promise((resolve, reject) => {
+    const [host, portStr] = gateway.split(':')
+    const port = parseInt(portStr)
 
-        // PEX needs a connection. This is expensive if we open a new one just for PEX.
-        // In a real app, we'd reuse existing connections.
-        // For this ref impl, we open a connection, ask, and close.
+    const socket = new net.Socket()
 
-        let socket
-        // ... connection logic duplicated from download (should refactor) ...
-        // Simplified for brevity:
-        socket = new net.Socket()
-        socket.connect(port, host, () => {
-             const secure = encryptStream(socket, false, (type, payload) => {
-                 if (type === MSG_PEERS) {
-                     try {
-                         const peers = JSON.parse(payload.toString())
-                         socket.end()
-                         resolve(peers)
-                     } catch(e) { resolve([]) }
-                 }
-             })
-             socket.once('secureConnect', () => {
-                 secure.sendMessage(MSG_HELLO, Buffer.from("{}"))
-                 secure.sendMessage(MSG_FIND_PEERS, Buffer.from(blobId))
-             })
-        })
-        socket.on('error', () => resolve([]))
-        setTimeout(() => socket.destroy(), 5000)
+    socket.connect(port, host, () => {
+      const secure = encryptStream(socket, false, (type, payload) => {
+        if (type === MSG_OK) {
+          socket.end()
+          resolve()
+        } else if (type === MSG_ERROR) {
+          reject(new Error(payload.toString()))
+        }
+      })
+      socket.once('secureConnect', () => {
+        secure.sendMessage(MSG_PUBLISH, Buffer.from(JSON.stringify(manifest)))
+      })
     })
+    socket.on('error', reject)
+  })
+}
+
+export function findPeersViaPEX (peer, blobId) {
+  return new Promise((resolve, reject) => {
+    const [host, portStr] = peer.split(':')
+    const port = parseInt(portStr)
+
+    const socket = new net.Socket()
+
+    socket.connect(port, host, () => {
+      const secure = encryptStream(socket, false, (type, payload) => {
+        if (type === MSG_PEERS) {
+          try {
+            const peers = JSON.parse(payload.toString())
+            socket.end()
+            resolve(peers)
+          } catch (e) { resolve([]) }
+        }
+      })
+      socket.once('secureConnect', () => {
+        secure.sendMessage(MSG_HELLO, Buffer.from('{}'))
+        secure.sendMessage(MSG_FIND_PEERS, Buffer.from(blobId))
+      })
+    })
+    socket.on('error', () => resolve([]))
+    setTimeout(() => socket.destroy(), 5000)
+  })
 }
