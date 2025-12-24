@@ -664,32 +664,32 @@ class Server extends EventEmitter {
     const socket = params.socket
 
     params.blob_ids.forEach(blobId => {
-        if (typeof blobId !== 'string' || blobId.length !== 64) return // Validate SHA256 hex
+      if (typeof blobId !== 'string' || blobId.length !== 64) return // Validate SHA256 hex
 
-        if (!this.blobIndex[blobId]) {
-            this.blobIndex[blobId] = new Set()
-        }
-        this.blobIndex[blobId].add(socket)
+      if (!this.blobIndex[blobId]) {
+        this.blobIndex[blobId] = new Set()
+      }
+      this.blobIndex[blobId].add(socket)
 
-        // Track for cleanup
-        if (!socket.heldBlobs) socket.heldBlobs = new Set()
-        socket.heldBlobs.add(blobId)
+      // Track for cleanup
+      if (!socket.heldBlobs) socket.heldBlobs = new Set()
+      socket.heldBlobs.add(blobId)
     })
 
     // Cleanup hook
     if (!socket._cleanupBlobsSetup) {
-        socket.on('close', () => {
-            if (socket.heldBlobs) {
-                for (const blobId of socket.heldBlobs) {
-                    if (this.blobIndex[blobId]) {
-                        this.blobIndex[blobId].delete(socket)
-                        if (this.blobIndex[blobId].size === 0) delete this.blobIndex[blobId]
-                    }
-                }
-                socket.heldBlobs.clear()
+      socket.on('close', () => {
+        if (socket.heldBlobs) {
+          for (const blobId of socket.heldBlobs) {
+            if (this.blobIndex[blobId]) {
+              this.blobIndex[blobId].delete(socket)
+              if (this.blobIndex[blobId].size === 0) delete this.blobIndex[blobId]
             }
-        })
-        socket._cleanupBlobsSetup = true
+          }
+          socket.heldBlobs.clear()
+        }
+      })
+      socket._cleanupBlobsSetup = true
     }
 
     cb(null, { action: 'announce_blob', status: 'ok' })
@@ -701,15 +701,15 @@ class Server extends EventEmitter {
 
     const peers = []
     if (this.blobIndex[blobId]) {
-        this.blobIndex[blobId].forEach(socket => {
-            if (socket.addr) peers.push(socket.addr)
-        })
+      this.blobIndex[blobId].forEach(socket => {
+        if (socket.addr) peers.push(socket.addr)
+      })
     }
 
     cb(null, {
-        action: 'find_blob_result',
-        blob_id: blobId,
-        peers: peers
+      action: 'find_blob_result',
+      blob_id: blobId,
+      peers
     })
   }
 

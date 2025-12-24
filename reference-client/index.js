@@ -4,9 +4,13 @@ import fs from 'fs'
 import path from 'path'
 import minimist from 'minimist'
 import Client from 'bittorrent-tracker'
+import { WebSocket } from 'ws'
 import { generateKeypair } from './lib/crypto.js'
 import { createManifest, validateManifest } from './lib/manifest.js'
 import { ingest, reassemble } from './lib/storage.js'
+import { startServer } from './lib/server.js'
+import { downloadBlob } from './lib/downloader.js'
+import { findBlob } from './lib/dht.js'
 
 const argv = minimist(process.argv.slice(2), {
   alias: {
@@ -25,12 +29,26 @@ const argv = minimist(process.argv.slice(2), {
 
 const command = argv._[0]
 
+function parseUri (input) {
+  if (input.startsWith('megatorrent://')) {
+    const withoutScheme = input.replace('megatorrent://', '')
+    // Simple case: just pubkey
+    // Complex case: pubkey/blobid
+    const parts = withoutScheme.split('/')
+    return {
+      publicKey: parts[0],
+      blobId: parts[1] || null
+    }
+  }
+  return { publicKey: input, blobId: null }
+}
+
 if (!command) {
   console.error(`Usage:
   gen-key [-k identity.json]
   ingest -i <file> [-d ./storage] -> Returns FileEntry JSON
   publish [-k identity.json] [-t ws://tracker] -i <file_entry.json>
-  subscribe [-t ws://tracker] <public_key_hex> [-d ./storage]
+  subscribe [-t ws://tracker] <public_key_hex|megatorrent://...> [-d ./storage]
   `)
   process.exit(1)
 }
@@ -50,27 +68,47 @@ if (command === 'gen-key') {
   fs.writeFileSync(argv.keyfile, JSON.stringify(data, null, 2))
   console.log(`Identity generated at ${argv.keyfile}`)
   console.log(`Public Key: ${data.publicKey}`)
+  console.log(`URI: megatorrent://${data.publicKey}`)
   process.exit(0)
 }
 
 // 2. Ingest
 if (command === 'ingest') {
+  // Start the Blob Server to serve content we ingest
+  const server = startServer(argv.dir, 0) // Port 0 = random
+  console.log(`Blob Server running on port ${server.port}`)
+
   if (!argv.input) {
-    console.error('Please specify input file with -i')
-    process.exit(1)
+    // If no input, just run as a server node
+    console.log('Running in server-only mode. Press Ctrl+C to exit.')
+
+    // Announce existing blobs?
+    // In a real app, we'd scan argv.dir and announce all.
+  } else {
+    const fileBuf = fs.readFileSync(argv.input)
+    const result = ingest(fileBuf, path.basename(argv.input))
+
+    // Save Blobs
+    result.blobs.forEach(blob => {
+      fs.writeFileSync(path.join(argv.dir, blob.id), blob.buffer)
+    })
+
+    console.log(`Ingested ${result.blobs.length} blobs to ${argv.dir}`)
+    console.log('FileEntry JSON (save this to a file to publish it):')
+    console.log(JSON.stringify(result.fileEntry, null, 2))
+
+    // Announce to Tracker (Discovery)
+    const blobIds = result.blobs.map(b => b.id)
+    const ws = new WebSocket(argv.tracker)
+    ws.on('open', () => {
+      ws.send(JSON.stringify({
+        action: 'announce_blob',
+        blob_ids: blobIds
+      }))
+      console.log('Announced blobs to tracker.')
+      // Keep running to serve
+    })
   }
-  const fileBuf = fs.readFileSync(argv.input)
-  const result = ingest(fileBuf, path.basename(argv.input))
-
-  // Save Blobs
-  result.blobs.forEach(blob => {
-    fs.writeFileSync(path.join(argv.dir, blob.id), blob.buffer)
-  })
-
-  console.log(`Ingested ${result.blobs.length} blobs to ${argv.dir}`)
-  console.log('FileEntry JSON (save this to a file to publish it):')
-  console.log(JSON.stringify(result.fileEntry, null, 2))
-  process.exit(0)
 }
 
 // 3. Publish
@@ -97,7 +135,6 @@ if (command === 'publish') {
     // Try parsing as JSON (FileEntry)
     const json = JSON.parse(content)
     // Wrap in our "Items" list.
-    // In the future, "Items" can be Magnet Links OR FileEntries.
     items = [json]
   } catch (e) {
     // Fallback: Line-separated magnet links
@@ -116,133 +153,128 @@ if (command === 'publish') {
 
   console.log('Publishing manifest:', JSON.stringify(manifest, null, 2))
 
-  // Connect to Tracker
-  const client = new Client({
-    infoHash: Buffer.alloc(20), // Dummy, not used for custom proto
-    peerId: Buffer.alloc(20), // Dummy
-    announce: [argv.tracker],
-    port: 6666
+  // Connect to Tracker using raw WebSocket for Control Plane
+  const ws = new WebSocket(argv.tracker)
+
+  ws.on('open', () => {
+    console.log('Connected to tracker.')
+    ws.send(JSON.stringify({
+      action: 'publish',
+      manifest
+    }))
   })
 
-  client.on('error', err => console.error('Client Error:', err.message))
-
-  client.on('update', () => {
-    // We don't expect standard updates
-  })
-
-  // We need to access the underlying socket to send our custom message
-  // bittorrent-tracker abstracts this, so we might need to hook into the `announce` phase or just use the socket directly if exposed.
-  // The library exposes `client._trackers` which is a list of Tracker instances.
-
-  // Wait for socket connection
-  setTimeout(() => {
-    const trackers = client._trackers
-    let sent = false
-
-    for (const tracker of trackers) {
-      // We only support WebSocket for this custom protocol right now
-      if (tracker.socket && tracker.socket.readyState === 1) { // OPEN
-        console.log('Sending publish message to ' + tracker.announceUrl)
-        tracker.socket.send(JSON.stringify({
-          action: 'publish',
-          manifest
-        }))
-        sent = true
-      }
-    }
-
-    if (sent) console.log('Publish sent!')
-    else console.error('No connected websocket trackers found.')
-
-    setTimeout(() => {
-      client.destroy()
+  ws.on('message', (data) => {
+    const msg = JSON.parse(data)
+    if (msg.action === 'publish' && msg.status === 'ok') {
+      console.log('Publish confirmed by tracker.')
       process.exit(0)
-    }, 1000)
-  }, 1000)
+    } else {
+      console.error('Unexpected response:', msg)
+    }
+  })
 }
 
 // 4. Subscribe
 if (command === 'subscribe') {
-  const pubKeyHex = argv._[1]
-  if (!pubKeyHex) {
-    console.error('Please provide public key hex')
+  const uri = argv._[1]
+  if (!uri) {
+    console.error('Please provide public key hex or megatorrent:// URI')
     process.exit(1)
   }
 
-  console.log(`Subscribing to ${pubKeyHex}...`)
+  const { publicKey } = parseUri(uri)
+  console.log(`Subscribing to ${publicKey}...`)
 
-  const client = new Client({
-    infoHash: Buffer.alloc(20),
-    peerId: Buffer.alloc(20),
-    announce: [argv.tracker],
-    port: 6667
+  // Start Server (to be a good peer)
+  startServer(argv.dir, 0)
+
+  // Connect to Tracker
+  const ws = new WebSocket(argv.tracker)
+
+  ws.on('open', () => {
+    console.log('Connected to tracker.')
+    ws.send(JSON.stringify({
+      action: 'subscribe',
+      key: publicKey
+    }))
   })
 
-  client.on('error', err => console.error('Client Error:', err.message))
+  ws.on('message', async (data) => {
+    let msg
+    try { msg = JSON.parse(data) } catch (e) { return }
 
-  // Hook into internal trackers to send subscribe
-  setInterval(() => {
-    const trackers = client._trackers
-    for (const tracker of trackers) {
-      if (tracker.socket && tracker.socket.readyState === 1 && !tracker._subscribed) {
-        console.log('Sending subscribe to ' + tracker.announceUrl)
-        tracker.socket.send(JSON.stringify({
-          action: 'subscribe',
-          key: pubKeyHex
-        }))
-        tracker._subscribed = true // simple flag to avoid spamming
+    if (msg.action === 'publish') {
+      console.log('\n>>> RECEIVED UPDATE <<<')
+      try {
+        if (validateManifest(msg.manifest) && msg.manifest.publicKey === publicKey) {
+          console.log(`New Manifest Sequence: ${msg.manifest.sequence}`)
+          await processManifest(msg.manifest)
+        } else {
+          console.error('Invalid signature on update.')
+        }
+      } catch (err) {
+        console.error('Validation error:', err.message)
+      }
+    }
+  })
 
-        // Listen for responses
-        const originalOnMessage = tracker.socket.onmessage
-        tracker.socket.onmessage = (event) => {
-          let data
-          try { data = JSON.parse(event.data) } catch (e) { return }
+  async function processManifest (manifest) {
+    const items = manifest.collections[0].items
+    for (const item of items) {
+      if (item.chunks) {
+        console.log(`Processing Item: ${item.name}`)
+        // Check if we have it
+        const outPath = path.join(argv.dir, item.name) // Simplified path
+        if (fs.existsSync(outPath)) {
+          console.log('Already downloaded.')
+          continue
+        }
 
-          if (data.action === 'publish') {
-            console.log('\n>>> RECEIVED UPDATE <<<')
-            const valid = validateManifest(data.manifest)
-            if (valid && data.manifest.publicKey === pubKeyHex) {
-              console.log('VERIFIED UPDATE from ' + pubKeyHex)
-              console.log('Sequence:', data.manifest.sequence)
+        // Download Chunks
+        const chunks = []
+        for (const chunk of item.chunks) {
+          const blobId = chunk.id
+          const blobPath = path.join(argv.dir, blobId)
 
-              const items = data.manifest.collections[0].items
-              console.log(`Received ${items.length} items.`)
-
-              // Auto-Download Logic (Prototype)
-              items.forEach(async (item, idx) => {
-                if (typeof item === 'object' && item.chunks) {
-                  console.log(`Item ${idx}: Detected Megatorrent FileEntry: ${item.name}`)
-                  try {
-                    const fileBuf = await reassemble(item, async (blobId) => {
-                      const p = path.join(argv.dir, blobId)
-                      if (fs.existsSync(p)) {
-                        return fs.readFileSync(p)
-                      }
-                      // TODO: Network fetch
-                      console.log(`Blob ${blobId} not found locally.`)
-                      return null
-                    })
-
-                    if (fileBuf) {
-                      const outPath = path.join(argv.dir, 'downloaded_' + item.name)
-                      fs.writeFileSync(outPath, fileBuf)
-                      console.log(`SUCCESS: Reassembled to ${outPath}`)
-                    }
-                  } catch (err) {
-                    console.error('Failed to reassemble:', err.message)
-                  }
-                } else {
-                  console.log(`Item ${idx}: Standard Magnet/Text: ${item}`)
-                }
-              })
-            } else {
-              console.error('Invalid signature or wrong key!')
-            }
+          if (fs.existsSync(blobPath)) {
+            chunks.push(fs.readFileSync(blobPath))
           } else {
-            if (originalOnMessage) originalOnMessage(event)
+            console.log(`Downloading blob ${blobId}...`)
+            // 1. Find Peers
+            const peers = await findBlob(argv.tracker, blobId)
+            // 2. Download
+            try {
+              // Simple retry logic
+              let downloaded = false
+              for (const peer of peers) {
+                try {
+                  const buffer = await downloadBlob(peer, blobId)
+                  fs.writeFileSync(blobPath, buffer)
+                  chunks.push(buffer)
+                  downloaded = true
+                  break
+                } catch (e) {
+                  console.error(`Failed peer ${peer}: ${e.message}`)
+                }
+              }
+              if (!downloaded) console.error(`Failed to download blob ${blobId}`)
+            } catch (e) {
+              console.error('Download error:', e)
+            }
+          }
+        }
+
+        if (chunks.length === item.chunks.length) {
+          const fileBuf = await reassemble(item, async (bid) => {
+            return fs.readFileSync(path.join(argv.dir, bid))
+          })
+          if (fileBuf) {
+            fs.writeFileSync(outPath, fileBuf)
+            console.log(`Successfully assembled ${item.name}`)
           }
         }
       }
     }
-  }, 1000)
+  }
 }
