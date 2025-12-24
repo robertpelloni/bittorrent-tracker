@@ -23,13 +23,18 @@ const argv = minimist(process.argv.slice(2), {
   }
 })
 
-// Configure Proxy if provided
+// Configure Proxy
 if (argv.proxy) {
   console.log(`Using SOCKS5 Proxy: ${argv.proxy}`)
   setGlobalProxy(argv.proxy)
 }
 
 const command = argv._[0]
+
+// Global State for Seeding/Gossip
+const heldBlobs = new Set() // BlobIDs we have on disk
+const knownSequences = {} // PubKey -> Seq
+let serverPort = 0
 
 function parseUri (input) {
   if (input.startsWith('megatorrent://')) {
@@ -53,12 +58,10 @@ if (!command) {
   process.exit(1)
 }
 
-// Ensure storage dir exists
 if (!fs.existsSync(argv.dir)) {
   fs.mkdirSync(argv.dir, { recursive: true })
 }
 
-// Initialize DHT
 let dht = null
 if (['ingest', 'publish', 'subscribe'].includes(command)) {
   dht = new DHTClient({ stateFile: path.join(argv.dir, 'dht_state.json') })
@@ -83,8 +86,8 @@ if (command === 'gen-key') {
 if (command === 'ingest') {
   const server = startSecureServer(argv.dir, 0)
   setTimeout(() => {
-    const port = server.port
-    console.log(`Secure Blob Server running on port ${port}`)
+    serverPort = server.port
+    console.log(`Secure Blob Server running on port ${serverPort}`)
 
     if (!argv.input) {
       console.log('Running in server-only mode. Press Ctrl+C to exit.')
@@ -94,18 +97,14 @@ if (command === 'ingest') {
 
       result.blobs.forEach(blob => {
         fs.writeFileSync(path.join(argv.dir, blob.id), blob.buffer)
+        heldBlobs.add(blob.id)
       })
 
       console.log(`Ingested ${result.blobs.length} blobs to ${argv.dir}`)
       console.log('FileEntry JSON (save this to a file to publish it):')
       console.log(JSON.stringify(result.fileEntry, null, 2))
 
-      console.log('Announcing blobs to DHT...')
-      const promises = result.blobs.map(b => dht.announceBlob(b.id, port))
-
-      Promise.all(promises).then(() => {
-        console.log('Announced all blobs.')
-      }).catch(err => console.error('Announce failed:', err))
+      announceHeldBlobs()
     }
   }, 500)
 }
@@ -171,16 +170,30 @@ if (command === 'subscribe') {
   const { publicKey } = parseUri(uri)
   console.log(`Looking up Manifest for ${publicKey} in DHT...`)
 
-  // Start Server
-  startSecureServer(argv.dir, 0)
+  const handleGossip = (gossip) => {
+    if (gossip && gossip[publicKey]) {
+      if (!knownSequences[publicKey] || gossip[publicKey] > knownSequences[publicKey]) {
+        console.log(`Gossip: Peer has newer sequence ${gossip[publicKey]}`)
+        checkUpdate()
+      }
+    }
+  }
 
-  // Poll DHT
+  const server = startSecureServer(argv.dir, 0, handleGossip)
+  setTimeout(() => {
+    serverPort = server.port
+    console.log(`Seeding on port ${serverPort}`)
+  }, 500)
+
   const checkUpdate = async () => {
     try {
       const res = await dht.getManifest(publicKey)
       if (res) {
-        console.log(`Found Manifest (Seq: ${res.seq})`)
-        await processManifest(res.manifest)
+        if (!knownSequences[publicKey] || res.seq > knownSequences[publicKey]) {
+          console.log(`Found New Manifest (Seq: ${res.seq})`)
+          knownSequences[publicKey] = res.seq
+          await processManifest(res.manifest)
+        }
       } else {
         console.log('No manifest found yet...')
       }
@@ -205,6 +218,8 @@ if (command === 'subscribe') {
         const outPath = path.join(argv.dir, item.name)
         if (fs.existsSync(outPath)) {
           console.log('Already downloaded.')
+          // Ensure we seed it
+          item.chunks.forEach(c => heldBlobs.add(c.id))
           continue
         }
 
@@ -215,6 +230,7 @@ if (command === 'subscribe') {
 
           if (fs.existsSync(blobPath)) {
             chunks.push(fs.readFileSync(blobPath))
+            heldBlobs.add(blobId)
           } else {
             console.log(`Finding peers for blob ${blobId}...`)
             const peers = await dht.findBlobPeers(blobId)
@@ -224,9 +240,14 @@ if (command === 'subscribe') {
             for (const peer of peers) {
               try {
                 console.log(`Connecting to ${peer}...`)
-                const buffer = await downloadSecureBlob(peer, blobId)
+                const buffer = await downloadSecureBlob(peer, blobId, knownSequences, handleGossip)
                 fs.writeFileSync(blobPath, buffer)
                 chunks.push(buffer)
+                heldBlobs.add(blobId)
+
+                // Announce immediately to become a seeder
+                if (serverPort) dht.announceBlob(blobId, serverPort)
+
                 downloaded = true
                 break
               } catch (e) {
@@ -248,5 +269,18 @@ if (command === 'subscribe') {
         }
       }
     }
+    // After processing, announce all held blobs
+    announceHeldBlobs()
   }
 }
+
+// Periodic Re-announce (Seeding)
+function announceHeldBlobs () {
+  if (heldBlobs.size > 0 && dht && serverPort) {
+    console.log(`Re-announcing ${heldBlobs.size} blobs to DHT...`)
+    const promises = Array.from(heldBlobs).map(bid => dht.announceBlob(bid, serverPort))
+    Promise.allSettled(promises).then(() => console.log('Announce complete.'))
+  }
+}
+
+setInterval(announceHeldBlobs, 15 * 60 * 1000) // Every 15 mins

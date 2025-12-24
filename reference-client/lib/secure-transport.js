@@ -137,14 +137,14 @@ function encryptStream (socket, isServer, onMessage) {
   }
 }
 
-export function startSecureServer (storageDir, port = 0) {
+export function startSecureServer (storageDir, port = 0, onGossip = null) {
   const server = net.createServer(socket => {
     const secure = encryptStream(socket, true, (type, payload) => {
       if (type === MSG_HELLO) {
         // Gossip: Peer sends { key, seq }
         try {
-          const gossip = JSON.parse(payload.toString()) // eslint-disable-line no-unused-vars
-          // TODO: Check if we have newer seq and reply?
+          const gossip = JSON.parse(payload.toString())
+          if (onGossip) onGossip(gossip, secure)
         } catch (e) {}
       } else if (type === MSG_REQUEST) {
         const blobId = payload.toString()
@@ -166,7 +166,7 @@ export function startSecureServer (storageDir, port = 0) {
   return server
 }
 
-export function downloadSecureBlob (peer, blobId, knownSequences = {}) {
+export function downloadSecureBlob (peer, blobId, knownSequences = {}, onGossip = null) {
   return new Promise((resolve, reject) => {
     const [host, portStr] = peer.split(':')
     const port = parseInt(portStr)
@@ -214,10 +214,9 @@ export function downloadSecureBlob (peer, blobId, knownSequences = {}) {
           cleanup()
           reject(new Error(payload.toString()))
         } else if (type === MSG_HELLO) {
-          // Handle Gossip Response
           try {
-            const gossip = JSON.parse(payload.toString()) // eslint-disable-line no-unused-vars
-            // Emit event? For now, we just log
+            const gossip = JSON.parse(payload.toString())
+            if (onGossip) onGossip(gossip)
           } catch (e) {}
         }
       })
