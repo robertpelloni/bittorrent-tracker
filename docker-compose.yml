@@ -1,0 +1,28 @@
+version: '3'
+services:
+  bootstrap:
+    build: .
+    command: serve --port 3000 --dir /data/bootstrap
+    volumes:
+      - ./data/bootstrap:/data/bootstrap
+    ports:
+      - "3000:3000"
+
+  node-a:
+    build: .
+    command: serve --port 3001 --dir /data/node-a --bootstrap bootstrap:0  # Port 0 logic needs fixing for PEX?
+    # Actually, bootstrap node needs fixed P2P port for others to find it via TCP if not using DHT.
+    # Our secure-transport binds port 0 (random).
+    # We should add --p2p-port flag to fix it.
+    volumes:
+      - ./data/node-a:/data/node-a
+    depends_on:
+      - bootstrap
+
+  node-b:
+    build: .
+    command: serve --port 3002 --dir /data/node-b --bootstrap bootstrap:0
+    volumes:
+      - ./data/node-b:/data/node-b
+    depends_on:
+      - bootstrap
