@@ -10,6 +10,7 @@ import { ingestStream } from './lib/storage.js'
 import { createManifest } from './lib/manifest.js'
 import { publishViaGateway } from './lib/secure-transport.js'
 import { DHTClient } from './lib/dht-real.js'
+import { SamSession } from './lib/i2p-sam.js'
 
 const argv = minimist(process.argv.slice(2), {
   alias: {
@@ -23,12 +24,14 @@ const argv = minimist(process.argv.slice(2), {
     a: 'announce-address',
     P: 'port',
     T: 'p2p-port',
-    j: 'json'
+    j: 'json',
+    I: 'i2p'
   },
   default: {
     keyfile: './identity.json',
     dir: './storage',
-    port: 3000
+    port: 3000,
+    i2p: false
   }
 })
 
@@ -152,12 +155,20 @@ if (command === 'publish') {
 }
 
 if (command === 'serve') {
+  let samSession = null
+  if (argv.i2p) {
+    samSession = new SamSession()
+    await samSession.connect()
+    log.info('[I2P] Connected to SAM bridge')
+  }
+
   const client = new MegatorrentClient({
     dir: argv.dir,
     proxy: argv.proxy,
     bootstrap: argv.bootstrap,
     announceAddress: argv['announce-address'],
-    p2pPort: argv['p2p-port']
+    p2pPort: argv['p2p-port'],
+    i2pSession: samSession
   })
 
   client.start().then(() => {
