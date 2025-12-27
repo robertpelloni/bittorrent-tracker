@@ -31,6 +31,7 @@
 
 #include <QtContainerFwd>
 #include <QObject>
+#include <QJsonArray>
 
 #include "base/pathfwd.h"
 #include "base/tagset.h"
@@ -487,6 +488,7 @@ namespace BitTorrent
         // Megatorrent API
         virtual bool addMegatorrentSubscription(const QString &publicKey, const QString &label) = 0;
         virtual bool removeMegatorrentSubscription(const QString &publicKey) = 0;
+        virtual QJsonArray getMegatorrentSubscriptions() const = 0;
 
     signals:
         void startupProgressUpdated(int progress);

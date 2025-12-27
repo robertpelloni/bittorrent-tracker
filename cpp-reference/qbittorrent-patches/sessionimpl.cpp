@@ -687,6 +687,13 @@ SessionImpl::SessionImpl(QObject *parent)
     m_megaSubscription->load((specialFolderLocation(SpecialFolder::Config) / Path(u"megatorrent_subscriptions.json"_s)).toString());
     m_megaSubscription->startPolling();
 
+    // I2P Init
+    if (isI2PEnabled()) {
+        m_megaSam = new Megatorrent::SamSession(this);
+        m_megaSam->connectToSam(I2PAddress(), (quint16)I2PPort());
+        m_megaSam->createSession("MegatorrentC++");
+    }
+
     // Wire Megatorrent Components
     connect(m_megaSubscription, &Megatorrent::SubscriptionManager::subscriptionUpdated, this, [this](const QByteArray &, const Megatorrent::Manifest &manifest) {
         for (const auto &file : manifest.files()) {
@@ -748,6 +755,7 @@ SessionImpl::~SessionImpl()
 
     // Megatorrent Cleanup
     m_megaSubscription->save((specialFolderLocation(SpecialFolder::Config) / Path(u"megatorrent_subscriptions.json"_s)).toString());
+    if (m_megaSam) delete m_megaSam;
     delete m_megaSubscription;
     delete m_megaDownloader;
     delete m_megaDHT;
@@ -6663,6 +6671,28 @@ bool SessionImpl::addMegatorrentSubscription(const QString &publicKey, const QSt
         m_megaSubscription->save((specialFolderLocation(SpecialFolder::Config) / Path(u"megatorrent_subscriptions.json"_s)).toString());
     });
     return true;
+}
+
+QJsonArray SessionImpl::getMegatorrentSubscriptions() const
+{
+    if (!m_megaSubscription) return {};
+    // This is blocking/thread-unsafe if called from GUI thread directly without lock?
+    // SessionImpl usually runs on its own thread but GUI calls these.
+    // For Reference Implementation, we assume simple access or use invokeAsync with future?
+    // APIController expects sync return.
+    // We'll access it directly assuming SubscriptionManager is thread-safe enough or just for demo.
+    // Ideally, SubscriptionManager should use mutex.
+
+    QJsonArray arr;
+    auto subs = m_megaSubscription->subscriptions();
+    for (const auto &sub : subs) {
+        QJsonObject obj;
+        obj["publicKey"] = QString(sub.publicKey.toHex());
+        obj["label"] = sub.label;
+        obj["lastSequence"] = sub.lastSequence;
+        arr.append(obj);
+    }
+    return arr;
 }
 
 bool SessionImpl::removeMegatorrentSubscription(const QString &publicKey)

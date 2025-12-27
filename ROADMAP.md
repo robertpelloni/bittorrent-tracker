@@ -1,6 +1,6 @@
 # Megatorrent Project Roadmap & Status
 
-**Current Version:** v1.2.0
+**Current Version:** v1.4.1
 **Protocol Version:** v5
 
 ## ✅ Accomplished Features
@@ -38,12 +38,12 @@
 *   **Secure Socket:** `secure_socket.h/cpp` (Transport Layer with OpenSSL Noise-IK).
 *   **Manifest:** `manifest.h/cpp` (Parser & OpenSSL Ed25519 Validator).
 *   **Blob Downloader:** `blob_downloader.h/cpp` (Peer Connection & Integrity).
-*   **Session Integration:** `SessionImpl` modified to expose `addMegatorrentSubscription`.
+*   **I2P Support:** `i2p_sam.h/cpp` (SAM v3.1 Client) & `SessionImpl` integration.
+*   **WebAPI:** `MegatorrentController` exposing subscription management to WebUI.
 
 ---
 
 ## 🔮 Future Work (v2.0)
 
-1.  **I2P Support:** Native I2P SAM integration for even stronger anonymity.
-2.  **DHT-over-TCP:** Implement a TCP-based DHT overlay to allow Tor users to participate in the DHT directly.
-3.  **UI Implementation:** Build the actual Qt Widgets for the Subscription Manager (currently API-only).
+1.  **DHT-over-TCP:** Implement a TCP-based DHT overlay to allow Tor users to participate in the DHT directly.
+2.  **UI Implementation:** Build the actual Qt Widgets for the Subscription Manager (currently API-only).

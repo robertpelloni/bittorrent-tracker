@@ -54,6 +54,7 @@
 #include "base/megatorrent_subscription.h"
 #include "base/dht_client.h"
 #include "base/blob_downloader.h"
+#include "base/i2p_sam.h"
 #include "base/blob_downloader.h"
 #include "addtorrentparams.h"
 #include "cachestatus.h"
@@ -464,11 +465,10 @@ namespace BitTorrent
 
         // Megatorrent API
         bool addMegatorrentSubscription(const QString &publicKey, const QString &label) override;
-        bool removeMegatorrentSubscription(const QString &publicKey) override;
-
         // Megatorrent API
         bool addMegatorrentSubscription(const QString &publicKey, const QString &label) override;
         bool removeMegatorrentSubscription(const QString &publicKey) override;
+        QJsonArray getMegatorrentSubscriptions() const override;
 
         // Torrent interface
         void handleTorrentResumeDataRequested(const TorrentImpl *torrent);
@@ -837,6 +837,7 @@ namespace BitTorrent
         Megatorrent::DHTClient *m_megaDHT = nullptr;
         Megatorrent::SubscriptionManager *m_megaSubscription = nullptr;
         Megatorrent::BlobDownloader *m_megaDownloader = nullptr;
+        Megatorrent::SamSession *m_megaSam = nullptr;
 
         Utils::Thread::UniquePtr m_ioThread;
         QThreadPool *m_asyncWorker = nullptr;

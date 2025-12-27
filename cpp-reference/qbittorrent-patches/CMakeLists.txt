@@ -127,6 +127,7 @@ add_library(qbt_base STATIC
     # megatorrent headers
     blob_downloader.h
     dht_client.h
+    i2p_sam.h
     manifest.h
     megatorrent_global.h
     secure_socket.h
@@ -232,6 +233,7 @@ add_library(qbt_base STATIC
     # megatorrent sources
     blob_downloader.cpp
     dht_client.cpp
+    i2p_sam.cpp
     manifest.cpp
     secure_socket.cpp
     megatorrent_subscription.cpp
