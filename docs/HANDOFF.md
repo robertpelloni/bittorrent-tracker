@@ -37,6 +37,20 @@ Modify `qbittorrent/src/base/CMakeLists.txt` to include the new files:
 ### 4. Link Dependencies
 Ensure `libtorrent` and `OpenSSL` are correctly linked. The provided stubs use `Crypto::` namespace placeholders that must be backed by real OpenSSL EVP calls.
 
+### 5. WebAPI Registration (Controller)
+To enable the WebUI frontend to talk to the backend:
+1.  Copy `megatorrentcontroller.h/cpp` to `qbittorrent/src/webui/api/`.
+2.  Modify `qbittorrent/src/webui/webapplication.cpp` (or similar router):
+    *   Include `megatorrentcontroller.h`
+    *   In `registerControllers()` (or constructor), add:
+        ```cpp
+        registerController<MegatorrentController>(u"megatorrent"_s);
+        ```
+    *   This maps:
+        *   `/api/v2/megatorrent/addSubscription` -> `addSubscriptionAction`
+        *   `/api/v2/megatorrent/removeSubscription` -> `removeSubscriptionAction`
+        *   `/api/v2/megatorrent/getSubscriptions` -> `getSubscriptionsAction`
+
 ---
 
 ## 🧩 Component Details

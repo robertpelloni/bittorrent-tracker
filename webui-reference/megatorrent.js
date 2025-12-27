@@ -2,12 +2,13 @@
 
 /* global $$, $, Element, fetch */
 
-const RPC_URL = 'http://localhost:3000/api/rpc'
-
 window.addEvent('domready', function () {
-  $('megatorrentTabLink').addEvent('click', function () {
-    loadMegatorrentTab()
-  })
+  const tabLink = $('megatorrentTabLink')
+  if (tabLink) {
+      tabLink.addEvent('click', function () {
+        loadMegatorrentTab()
+      })
+  }
 })
 
 function loadMegatorrentTab () {
@@ -41,9 +42,10 @@ function renderMegatorrentUI (container) {
         <table class="dynamicTable" style="width: 100%;">
             <thead>
                 <tr>
-                    <th>URI</th>
-                    <th>Status</th>
+                    <th>Public Key</th>
+                    <th>Label</th>
                     <th>Last Sequence</th>
+                    <th>Action</th>
                 </tr>
             </thead>
             <tbody id="megaSubsList"></tbody>
@@ -52,43 +54,83 @@ function renderMegatorrentUI (container) {
 
   document.getElementById('megaSubscribeBtn').addEventListener('click', function () {
     const uri = document.getElementById('megaUriInput').value
-    if (uri) rpcCall('addSubscription', { uri }).then(refreshSubscriptions)
+    if (uri) addSubscription(uri).then(refreshSubscriptions)
   })
+}
+
+async function addSubscription (uri) {
+    try {
+      // Parse URI to get Key
+      let publicKey = uri
+      if (uri.startsWith('megatorrent://')) {
+          const parts = uri.replace('megatorrent://', '').split('/')
+          const auth = parts[0].split(':')
+          publicKey = auth[0]
+      }
+      const label = uri // or prompt user
+
+      const response = await fetch('api/v2/megatorrent/addSubscription', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          publicKey: publicKey,
+          label: label
+        })
+      })
+
+      if (!response.ok) throw new Error(response.statusText)
+      return true
+    } catch (e) {
+      console.error('Add Subscription Error:', e)
+      alert('Failed to add subscription: ' + e.message)
+      return false
+    }
+}
+
+async function removeSubscription (publicKey) {
+    if (!confirm('Remove subscription?')) return;
+    try {
+      const response = await fetch('api/v2/megatorrent/removeSubscription', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ publicKey })
+      })
+      if (!response.ok) throw new Error(response.statusText)
+      refreshSubscriptions()
+    } catch (e) {
+        console.error(e)
+    }
 }
 
 async function refreshSubscriptions () {
   try {
-    const subs = await rpcCall('getSubscriptions', {})
-    const status = await rpcCall('getStatus', {})
-
-    document.getElementById('megaStatus').innerText = `Peers: ${status.peers} | Blobs: ${status.heldBlobs}`
+    const response = await fetch('api/v2/megatorrent/getSubscriptions')
+    if (!response.ok) throw new Error('API Error')
+    const subs = await response.json() // Expect Array
 
     const list = document.getElementById('megaSubsList')
     list.innerHTML = ''
 
-    if (subs.subscriptions.length === 0) {
-      list.innerHTML = '<tr><td colspan="3" style="text-align:center">No subscriptions</td></tr>'
+    if (subs.length === 0) {
+      list.innerHTML = '<tr><td colspan="4" style="text-align:center">No subscriptions</td></tr>'
     } else {
-      subs.subscriptions.forEach(sub => {
-        const row = new Element('tr')
+      subs.forEach(sub => {
+        const row = document.createElement('tr')
         row.innerHTML = `
-                <td>${sub.uri.substring(0, 50)}...</td>
-                <td>${sub.status}</td>
+                <td>${sub.publicKey.substring(0, 20)}...</td>
+                <td>${sub.label}</td>
                 <td>${sub.lastSequence}</td>
+                <td><button onclick="removeSubscription('${sub.publicKey}')">Remove</button></td>
             `
+        // Note: onclick with global function requires attaching to window or rewrite.
+        // For reference, simple addEventListener is safer.
+        const btn = row.querySelector('button')
+        btn.addEventListener('click', () => removeSubscription(sub.publicKey))
+
         list.appendChild(row)
       })
     }
   } catch (e) {
-    document.getElementById('megaStatus').innerText = 'Daemon Offline'
+    document.getElementById('megaStatus').innerText = 'Daemon Offline / API Error'
   }
-}
-
-async function rpcCall (method, params) {
-  const res = await fetch(RPC_URL, {
-    method: 'POST',
-    body: JSON.stringify({ method, params })
-  })
-  const json = await res.json()
-  return json.result
 }
